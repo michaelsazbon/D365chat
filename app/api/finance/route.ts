@@ -1,9 +1,10 @@
 import { NextRequest } from "next/server";
+import Groq from "groq-sdk";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import type { ChartData } from "@/types/chart";
 
 // Initialize Google AI client
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_AI_API_KEY!);
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 export const runtime = "edge";
 
@@ -21,72 +22,6 @@ interface ChartToolResponse extends ChartData {
   // Any additional properties specific to the tool response
 }
 
-
-const tools = [
-  {
-    name: "generate_graph_data",
-    description:
-      "Generate structured JSON data for creating financial charts and graphs.",
-      parameters: {
-      type: "object",
-      properties: {
-        chartType: {
-          type: "string",
-          enum: [
-            "bar",
-            "multiBar",
-            "line",
-            "pie",
-            "area",
-            "stackedArea",
-          ],
-          description: "The type of chart to generate",
-        },
-        config: {
-          type: "object",
-          properties: {
-            title: { type: "string" },
-            description: { type: "string" },
-            trend: {
-              type: "object",
-              properties: {
-                percentage: { type: "number" },
-                direction: {
-                  type: "string",
-                  enum: ["up", "down"],
-                },
-              },
-              required: ["percentage", "direction"],
-            },
-            footer: { type: "string" },
-            totalLabel: { type: "string" },
-            xAxisKey: { type: "string" },
-          },
-          required: ["title", "description"],
-        },
-        data: {
-          type: "array",
-          items: {
-            type: "object",
-            additionalProperties: true,
-          },
-        },
-        chartConfig: {
-          type: "object",
-          additionalProperties: {
-            type: "object",
-            properties: {
-              label: { type: "string" },
-              stacked: { type: "boolean" },
-            },
-            required: ["label"],
-          },
-        },
-      },
-      required: ["chartType", "config", "data", "chartConfig"],
-    },
-  },
-];
 
 const SYSTEM_PROMPT = `You are a financial data visualization expert. Your role is to analyze financial data and create clear, meaningful visualizations using generate_graph_data tool:
 
@@ -129,18 +64,105 @@ When generating visualizations:
 4. Add contextual footer notes
 5. Use proper data keys that reflect the actual metrics
 
+Data Structure Examples:
+
+For Time-Series (Line/Bar/Area):
+{
+  data: [
+    { period: "Q1 2024", revenue: 1250000 },
+    { period: "Q2 2024", revenue: 1450000 }
+  ],
+  config: {
+    xAxisKey: "period",
+    title: "Quarterly Revenue",
+    description: "Revenue growth over time"
+  },
+  chartConfig: {
+    revenue: { label: "Revenue ($)" }
+  }
+}
+
+For Comparisons (MultiBar):
+{
+  data: [
+    { category: "Product A", sales: 450000, costs: 280000 },
+    { category: "Product B", sales: 650000, costs: 420000 }
+  ],
+  config: {
+    xAxisKey: "category",
+    title: "Product Performance",
+    description: "Sales vs Costs by Product"
+  },
+  chartConfig: {
+    sales: { label: "Sales ($)" },
+    costs: { label: "Costs ($)" }
+  }
+}
+
+For Distributions (Pie):
+{
+  data: [
+    { segment: "Equities", value: 5500000 },
+    { segment: "Bonds", value: 3200000 }
+  ],
+  config: {
+    xAxisKey: "segment",
+    title: "Portfolio Allocation",
+    description: "Current investment distribution",
+    totalLabel: "Total Assets"
+  },
+  chartConfig: {
+    equities: { label: "Equities" },
+    bonds: { label: "Bonds" }
+  }
+}
+
 Always:
 - Generate real, contextually appropriate data
 - Use proper financial formatting
 - Include relevant trends and insights
 - Structure data exactly as needed for the chosen chart type
 - Choose the most appropriate visualization for the data
+- Add a textual response in the field txtResponse in the JSON response object
 
 Never:
 - Use placeholder or static data
+- Announce the tool usage
 - Include technical implementation details in responses
+- NEVER SAY you are using the generate_graph_data tool, just execute it when needed.
 
-Focus on clear financial insights and let the visualization enhance understanding.`;
+Focus on clear financial insights and let the visualization enhance understanding.
+
+Return the result as a JSON object with this schema :
+
+ChartData {
+  chartType: "bar" | "multiBar" | "line" | "pie" | "area" | "stackedArea";
+  config: {
+    title: string;
+    description: string;
+    trend?: {
+      percentage: number;
+      direction: "up" | "down";
+    };
+    footer?: string;
+    totalLabel?: string;
+    xAxisKey?: string;
+  };
+  data: Array<Record<string, any>>;
+  chartConfig: ChartConfig;
+  txtResponse: string;
+}
+
+
+ChartConfig {
+  [key: string]: {
+    label: string;
+    stacked?: boolean;
+    color?: string;
+  };
+}
+
+`;
 
 export async function POST(req: NextRequest) {
   try {
@@ -163,10 +185,10 @@ export async function POST(req: NextRequest) {
     }
 
     // Format messages for Gemini
-    let formattedMessages = messages.map((msg: any) => ({
-      role: msg.role === "user" ? "user" : "model",
-      parts: [{ text: msg.content }],
-    }));
+    // let formattedMessages = messages.map((msg: any) => ({
+    //   role: msg.role === "user" ? "user" : "assistant",
+    //   content: [{ text: msg.content }],
+    // }));
 
     // Handle file in the latest message
     if (fileData) {
@@ -221,35 +243,32 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // Initialize the chat
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-pro",
-      tools: { functionDeclarations: tools },
-     });
-    const chat = model.startChat({
-      history: formattedMessages.slice(0, -1),
-      generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 4096,
-      },
+    messages.unshift({
+      role: "system",
+      content: SYSTEM_PROMPT
     });
 
-    // Add system prompt to the context
-    await chat.sendMessage(SYSTEM_PROMPT);
-
-    // Send the last message and get response
-    const result = await chat.sendMessage(formattedMessages[formattedMessages.length - 1].parts[0].text);
-    const response = await result.response;
-    const responseText = response.text();
+    const chatCompletion = await groq.chat.completions.create({
+      "messages": messages,
+      "model": "llama-3.2-90b-text-preview",
+      "temperature": 0.1,
+      "max_tokens": 6000,
+      "top_p": 1,
+      "stream": false,
+      "response_format": {
+        "type": "json_object"
+      },
+      "stop": null
+    });
 
     // Parse the response to extract tool usage and chart data
-    const toolUseMatch = responseText.match(/```json\n([\s\S]*?)\n```/);
+    const toolUseMatch = chatCompletion.choices[0].message.content;
     let toolUseContent = null;
     let chartData = null;
 
     if (toolUseMatch) {
       try {
-        toolUseContent = JSON.parse(toolUseMatch[1]);
+        toolUseContent = JSON.parse(toolUseMatch);
         chartData = processToolResponse(toolUseContent);
       } catch (e) {
         console.error("Failed to parse tool use content:", e);
@@ -263,7 +282,7 @@ export async function POST(req: NextRequest) {
       const chartData = toolUseContent as ChartToolResponse;
 
       if (
-        !chartData.chart_type ||
+        !chartData.chartType ||
         !chartData.data ||
         !Array.isArray(chartData.data)
       ) {
@@ -271,7 +290,7 @@ export async function POST(req: NextRequest) {
       }
 
       // Transform data for pie charts
-      if (chartData.chart_type === "pie") {
+      if (chartData.chartType === "pie") {
         chartData.data = chartData.data.map((item) => {
           const valueKey = Object.keys(chartData.chartConfig)[0];
           const segmentKey = chartData.config.xAxisKey || "segment";
@@ -305,7 +324,7 @@ export async function POST(req: NextRequest) {
 
     return new Response(
       JSON.stringify({
-        content: responseText,
+        content: toolUseContent.txtResponse,
         hasToolUse: !!toolUseContent,
         toolUse: toolUseContent,
         chartData: chartData,
